@@ -1,12 +1,11 @@
-import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
-from data_pipeline import consolidate, load_master_csv, STANDARD_COLS
-from forecasting import time_ordered_backtest, final_forecast, all_metrics
+from data_pipeline import consolidate, load_master_csv, ENRICHED_COLS, totals_series, category_mix
+from forecasting import time_ordered_backtest, final_forecast
 
 st.set_page_config(page_title="Life Insurance NBP — Sales Analysis & Forecasting",
                     layout="wide", page_icon="📈")
@@ -23,7 +22,7 @@ data_mode = st.sidebar.radio(
 def get_demo_data():
     return load_master_csv("synthetic_nbp_master.csv")
 
-master_df = pd.DataFrame(columns=STANDARD_COLS)
+master_df = pd.DataFrame(columns=ENRICHED_COLS)
 
 if data_mode == "Use demo data (synthetic, realistic)":
     master_df = get_demo_data()
@@ -31,7 +30,8 @@ if data_mode == "Use demo data (synthetic, realistic)":
                         f"{master_df['Insurer'].nunique()} insurers.")
 else:
     uploaded = st.sidebar.file_uploader(
-        "Upload monthly council files (.xls/.xlsx) or a consolidated .csv",
+        "Upload monthly council files (.xls — real HTML export) or CSVs "
+        "(pre-cleaned or already-consolidated)",
         type=["xls", "xlsx", "csv"], accept_multiple_files=True,
     )
     if uploaded:
@@ -48,8 +48,8 @@ else:
         st.sidebar.info("Upload files to begin, or switch to demo data.")
 
 st.title("📈 Life Insurance New Business — Sales Analysis & Forecasting")
-st.caption("Analyze historical new-business premium & policy trends, and forecast future sales "
-           "performance across insurers and time.")
+st.caption("Analyze historical new-business premium & policy trends across insurers and "
+           "premium categories, and forecast future sales performance.")
 
 if master_df.empty:
     st.warning("No data loaded yet. Select **demo data** in the sidebar to explore the app now, "
@@ -57,79 +57,140 @@ if master_df.empty:
     st.stop()
 
 # ---------------- Prep ----------------
-master_df["MonthDate"] = pd.to_datetime(master_df["Month"], format="%Y-%m")
-industry = (master_df.groupby("MonthDate", as_index=False)
+totals_df = totals_series(master_df)
+mix_df = category_mix(master_df)
+
+if totals_df.empty:
+    st.error("Data loaded, but no 'Total' rows were found per insurer/month — check the "
+             "uploaded file layout in the Assumptions tab for the expected format.")
+    st.stop()
+
+totals_df["MonthDate"] = pd.to_datetime(totals_df["Month"], format="%Y-%m")
+mix_df["MonthDate"] = pd.to_datetime(mix_df["Month"], format="%Y-%m")
+
+industry = (totals_df.groupby("MonthDate", as_index=False)
             .agg(Premium_Rs_Crore=("Premium_Rs_Crore", "sum"),
                  No_of_Policies=("No_of_Policies", "sum")))
 industry = industry.sort_values("MonthDate")
 industry = industry.set_index("MonthDate").asfreq("MS").reset_index()
 industry[["Premium_Rs_Crore", "No_of_Policies"]] = industry[["Premium_Rs_Crore", "No_of_Policies"]].interpolate()
 
-tabs = st.tabs(["🔎 Overview & EDA", "🧪 Backtesting", "🔮 Forecast", "💡 Insights",
-                 "📄 Assumptions & Limitations"])
+n_months = industry["MonthDate"].nunique()
+
+tabs = st.tabs(["🔎 Overview & EDA", "🧩 Premium Category Mix", "🧪 Backtesting", "🔮 Forecast",
+                 "💡 Insights", "📄 Assumptions & Limitations"])
 
 # ================= TAB 1: EDA =================
 with tabs[0]:
+    if n_months < 2:
+        st.info(f"Only **{n_months} month** of data loaded so far. Trend/seasonality charts "
+                "need multiple months — upload more monthly files to unlock them. Showing "
+                "what's available below.")
+
     c1, c2, c3, c4 = st.columns(4)
     latest = industry.iloc[-1]
-    prev_year = industry[industry["MonthDate"] == latest["MonthDate"] - pd.DateOffset(years=1)]
-    yoy = ((latest["Premium_Rs_Crore"] / prev_year["Premium_Rs_Crore"].values[0]) - 1) * 100 \
-        if len(prev_year) else np.nan
+    prev_year_row = industry[industry["MonthDate"] == latest["MonthDate"] - pd.DateOffset(years=1)]
+    yoy = ((latest["Premium_Rs_Crore"] / prev_year_row["Premium_Rs_Crore"].values[0]) - 1) * 100 \
+        if len(prev_year_row) else np.nan
     c1.metric("Latest Month", latest["MonthDate"].strftime("%b %Y"))
     c2.metric("Industry NBP (₹ crore)", f"{latest['Premium_Rs_Crore']:,.0f}",
               f"{yoy:+.1f}% YoY" if not np.isnan(yoy) else None)
     c3.metric("Policies Issued", f"{latest['No_of_Policies']:,.0f}")
-    c4.metric("Active Insurers", master_df["Insurer"].nunique())
+    c4.metric("Active Insurers", totals_df["Insurer"].nunique())
 
-    st.subheader("Industry Trend & Seasonality")
+    st.subheader("Industry Trend")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=industry["MonthDate"], y=industry["Premium_Rs_Crore"],
                               mode="lines+markers", name="Industry NBP (₹ crore)"))
     fig.update_layout(height=400, xaxis_title="Month", yaxis_title="Premium (₹ crore)")
     st.plotly_chart(fig, use_container_width=True)
 
-    colA, colB = st.columns(2)
-    with colA:
-        st.subheader("Seasonality (avg by calendar month)")
-        seasonal = industry.copy()
-        seasonal["MonthNum"] = seasonal["MonthDate"].dt.month
-        seasonal_avg = seasonal.groupby("MonthNum")["Premium_Rs_Crore"].mean().reset_index()
-        seasonal_avg["MonthName"] = pd.to_datetime(seasonal_avg["MonthNum"], format="%m").dt.strftime("%b")
-        fig2 = px.bar(seasonal_avg, x="MonthName", y="Premium_Rs_Crore")
-        fig2.update_layout(height=350)
-        st.plotly_chart(fig2, use_container_width=True)
-    with colB:
+    if n_months >= 12:
+        colA, colB = st.columns(2)
+        with colA:
+            st.subheader("Seasonality (avg by calendar month)")
+            seasonal = industry.copy()
+            seasonal["MonthNum"] = seasonal["MonthDate"].dt.month
+            seasonal_avg = seasonal.groupby("MonthNum")["Premium_Rs_Crore"].mean().reset_index()
+            seasonal_avg["MonthName"] = pd.to_datetime(seasonal_avg["MonthNum"], format="%m").dt.strftime("%b")
+            fig2 = px.bar(seasonal_avg, x="MonthName", y="Premium_Rs_Crore")
+            fig2.update_layout(height=350)
+            st.plotly_chart(fig2, use_container_width=True)
+        with colB:
+            st.subheader("Insurer Market Share (latest month)")
+            latest_month = totals_df["MonthDate"].max()
+            share = totals_df[totals_df["MonthDate"] == latest_month]
+            fig3 = px.pie(share, names="Insurer", values="Premium_Rs_Crore", hole=0.4)
+            fig3.update_layout(height=350)
+            st.plotly_chart(fig3, use_container_width=True)
+    else:
         st.subheader("Insurer Market Share (latest month)")
-        latest_month = master_df["MonthDate"].max()
-        share = master_df[master_df["MonthDate"] == latest_month]
+        latest_month = totals_df["MonthDate"].max()
+        share = totals_df[totals_df["MonthDate"] == latest_month]
         fig3 = px.pie(share, names="Insurer", values="Premium_Rs_Crore", hole=0.4)
-        fig3.update_layout(height=350)
+        fig3.update_layout(height=400)
         st.plotly_chart(fig3, use_container_width=True)
 
     st.subheader("Insurer Contribution Over Time")
-    top_insurers = (master_df.groupby("Insurer")["Premium_Rs_Crore"].sum()
+    top_insurers = (totals_df.groupby("Insurer")["Premium_Rs_Crore"].sum()
                      .sort_values(ascending=False).head(8).index.tolist())
-    trend_df = master_df[master_df["Insurer"].isin(top_insurers)]
+    trend_df = totals_df[totals_df["Insurer"].isin(top_insurers)]
     fig4 = px.area(trend_df, x="MonthDate", y="Premium_Rs_Crore", color="Insurer")
     fig4.update_layout(height=420)
     st.plotly_chart(fig4, use_container_width=True)
 
-# ================= TAB 2: Backtesting =================
+# ================= TAB 2: Premium Category Mix =================
 with tabs[1]:
+    st.subheader("Premium Mix by Business Category")
+    st.caption("Individual vs Group, Single vs Non-Single premium — the category breakdown "
+               "your brief specifically called out.")
+
+    cat_totals = (mix_df.groupby(["MonthDate", "BusinessType"], as_index=False)
+                  .agg(Premium_Rs_Crore=("Premium_Current_Month", "sum")))
+
+    fig_mix = px.area(cat_totals, x="MonthDate", y="Premium_Rs_Crore", color="BusinessType")
+    fig_mix.update_layout(height=450, xaxis_title="Month", yaxis_title="Premium (₹ crore)")
+    st.plotly_chart(fig_mix, use_container_width=True)
+
+    latest_month_mix = mix_df["MonthDate"].max()
+    latest_mix = (mix_df[mix_df["MonthDate"] == latest_month_mix]
+                  .groupby("BusinessType", as_index=False)
+                  .agg(Premium_Rs_Crore=("Premium_Current_Month", "sum")))
+    col1, col2 = st.columns(2)
+    with col1:
+        fig_pie = px.pie(latest_mix, names="BusinessType", values="Premium_Rs_Crore",
+                          title=f"Category Split — {latest_month_mix.strftime('%b %Y')}", hole=0.4)
+        st.plotly_chart(fig_pie, use_container_width=True)
+    with col2:
+        st.subheader("Insurer × Category (latest month)")
+        pivot = (mix_df[mix_df["MonthDate"] == latest_month_mix]
+                 .pivot_table(index="Insurer", columns="BusinessType",
+                              values="Premium_Current_Month", aggfunc="sum", fill_value=0))
+        st.dataframe(pivot.style.format("{:,.1f}"), use_container_width=True, height=350)
+
+# ================= TAB 3: Backtesting =================
+with tabs[2]:
     st.subheader("Time-Ordered Backtest — Candidate Model Comparison")
     st.caption("Rolling-origin backtest: each fold trains only on past months and forecasts "
-               "forward, exactly like a real deployment — no shuffling, no leakage.")
+               "forward — no shuffling, no leakage.")
+
+    if n_months < 15:
+        st.warning(f"Only **{n_months} months** loaded. Backtesting needs a reasonable training "
+                   "history + horizon (ideally 18+ months) to produce meaningful folds. "
+                   "Results below may be limited or unavailable until more months are uploaded.")
 
     target_metric = st.selectbox("Backtest target", ["Premium_Rs_Crore", "No_of_Policies"], key="bt_target")
-    horizon = st.slider("Forecast horizon per fold (months)", 1, 6, 3)
-    min_train = st.slider("Minimum training window (months)", 12, max(12, len(industry) - horizon - 1), 18)
+    horizon = st.slider("Forecast horizon per fold (months)", 1, 6, min(3, max(1, n_months // 4)))
+    max_min_train = max(3, n_months - horizon - 1)
+    min_train = st.slider("Minimum training window (months)", 3, max_min_train, min(6, max_min_train))
 
     series = industry.set_index("MonthDate")[target_metric]
     with st.spinner("Running rolling-origin backtest across all candidate models..."):
         bt_results = time_ordered_backtest(series, horizon=horizon, min_train=min_train)
 
     if bt_results.empty:
-        st.warning("Not enough history for this horizon/training-window combination. Reduce the horizon or minimum training window.")
+        st.warning("Not enough history for this horizon/training-window combination. "
+                   "Reduce the horizon or minimum training window, or upload more months.")
     else:
         st.dataframe(bt_results.style.highlight_min(subset=["MAE", "RMSE", "WAPE_%"], color="#d4f4dd")
                      .highlight_min(subset=["Bias_%"], color="#f4f4d4"),
@@ -139,18 +200,23 @@ with tabs[1]:
         st.caption("MAE / RMSE / WAPE — lower is better. Bias — closer to 0% is better "
                    "(positive = over-forecasting, negative = under-forecasting).")
 
-# ================= TAB 3: Forecast =================
-with tabs[2]:
+# ================= TAB 4: Forecast =================
+with tabs[3]:
     st.subheader("Forward-Looking Forecast")
+    if n_months < 6:
+        st.warning(f"Only **{n_months} months** loaded — forecasts with this little history "
+                   "will be low-confidence trend projections rather than reliable seasonal "
+                   "forecasts. Upload more months for a stronger forecast.")
+
     fc_target = st.selectbox("Forecast target", ["Premium_Rs_Crore", "No_of_Policies"], key="fc_target")
-    fc_horizon = st.slider("Forecast horizon (months ahead)", 1, 12, 6)
+    max_horizon = 12 if n_months >= 12 else max(1, n_months)
+    fc_horizon = st.slider("Forecast horizon (months ahead)", 1, max_horizon, min(3, max_horizon))
 
     series = industry.set_index("MonthDate")[fc_target]
     with st.spinner("Fitting SARIMA and Holt-Winters models..."):
         fc = final_forecast(series, horizon=fc_horizon)
 
     hist_df = industry[["MonthDate", fc_target]].rename(columns={fc_target: "Actual"})
-    hist_df["Type"] = "Actual"
 
     fig5 = go.Figure()
     fig5.add_trace(go.Scatter(x=hist_df["MonthDate"], y=hist_df["Actual"],
@@ -177,66 +243,77 @@ with tabs[2]:
     csv = fc.to_csv(index=False).encode()
     st.download_button("⬇️ Download forecast as CSV", csv, "nbp_forecast.csv", "text/csv")
 
-# ================= TAB 4: Insights =================
-with tabs[3]:
+# ================= TAB 5: Insights =================
+with tabs[4]:
     st.subheader("Auto-Generated Business Insights")
-    last12 = industry.tail(12)
-    prev12 = industry.iloc[-24:-12] if len(industry) >= 24 else pd.DataFrame()
-    yoy_growth = ((last12["Premium_Rs_Crore"].sum() / prev12["Premium_Rs_Crore"].sum()) - 1) * 100 \
-        if len(prev12) else None
-
-    top_insurer_latest = (master_df[master_df["MonthDate"] == master_df["MonthDate"].max()]
-                           .sort_values("Premium_Rs_Crore", ascending=False).iloc[0])
-    peak_month = (industry.assign(MonthNum=industry["MonthDate"].dt.month)
-                  .groupby("MonthNum")["Premium_Rs_Crore"].mean().idxmax())
-    peak_month_name = pd.to_datetime(str(peak_month), format="%m").strftime("%B")
-
-    growing = (master_df.groupby("Insurer").apply(
-        lambda d: d.sort_values("MonthDate")["Premium_Rs_Crore"].pct_change().mean() * 100
-    ).sort_values(ascending=False))
-
     bullets = []
-    if yoy_growth is not None:
+
+    if n_months >= 24:
+        last12 = industry.tail(12)
+        prev12 = industry.iloc[-24:-12]
+        yoy_growth = ((last12["Premium_Rs_Crore"].sum() / prev12["Premium_Rs_Crore"].sum()) - 1) * 100
         direction = "grew" if yoy_growth >= 0 else "declined"
         bullets.append(f"Trailing 12-month industry NBP **{direction} {abs(yoy_growth):.1f}%** YoY.")
+
+    top_insurer_latest = (totals_df[totals_df["MonthDate"] == totals_df["MonthDate"].max()]
+                           .sort_values("Premium_Rs_Crore", ascending=False).iloc[0])
     bullets.append(f"**{top_insurer_latest['Insurer']}** leads market share in the latest month "
                     f"with ₹{top_insurer_latest['Premium_Rs_Crore']:,.0f} crore.")
-    bullets.append(f"**{peak_month_name}** is consistently the strongest month for new business "
-                    f"— plan capacity and campaigns around this peak.")
-    if len(growing) > 0:
-        bullets.append(f"**{growing.index[0]}** shows the strongest average month-on-month growth "
-                        f"momentum among all insurers.")
+
+    if n_months >= 12:
+        peak_month = (industry.assign(MonthNum=industry["MonthDate"].dt.month)
+                      .groupby("MonthNum")["Premium_Rs_Crore"].mean().idxmax())
+        peak_month_name = pd.to_datetime(str(peak_month), format="%m").strftime("%B")
+        bullets.append(f"**{peak_month_name}** is consistently the strongest month for new "
+                        f"business — plan capacity and campaigns around this peak.")
+
+    if totals_df["Insurer"].nunique() > 1 and totals_df["MonthDate"].nunique() > 1:
+        growing = (totals_df.groupby("Insurer").apply(
+            lambda d: d.sort_values("MonthDate")["Premium_Rs_Crore"].pct_change().mean() * 100
+        ).dropna().sort_values(ascending=False))
+        if len(growing) > 0:
+            bullets.append(f"**{growing.index[0]}** shows the strongest average month-on-month "
+                            f"growth momentum among all insurers.")
+
+    latest_month_for_mix = mix_df["MonthDate"].max()
+    top_category = (mix_df[mix_df["MonthDate"] == latest_month_for_mix]
+                     .groupby("BusinessType")["Premium_Current_Month"].sum().idxmax())
+    bullets.append(f"**{top_category}** is the largest premium category in the latest month — "
+                    "see the Premium Category Mix tab for the full breakdown.")
 
     for b in bullets:
         st.markdown(f"- {b}")
 
-    st.subheader("Growth Leaderboard (avg MoM % change)")
-    st.dataframe(growing.reset_index().rename(
-        columns={0: "Avg_MoM_Growth_%", "Premium_Rs_Crore": "Avg_MoM_Growth_%"}
-    ).round(2), use_container_width=True)
+    if totals_df["Insurer"].nunique() > 1 and totals_df["MonthDate"].nunique() > 1:
+        st.subheader("Growth Leaderboard (avg MoM % change)")
+        st.dataframe(growing.reset_index().rename(columns={0: "Avg_MoM_Growth_%"}).round(2),
+                     use_container_width=True)
 
-# ================= TAB 5: Assumptions =================
-with tabs[4]:
+# ================= TAB 6: Assumptions =================
+with tabs[5]:
     st.subheader("Assumptions & Limitations")
     st.markdown("""
 **Data**
-- Demo mode uses a **synthetic dataset** shaped like the real Life Insurance Council monthly
-  NBP files (insurer × month × premium × policy count), with realistic trend, March fiscal-year-end
-  seasonality, and random shocks — for pipeline testing and demoing before real data is loaded.
-- Real data should be downloaded month-by-month from lifeinscouncil.org and uploaded via the
-  sidebar; the parser auto-detects HTML-as-.xls council exports, genuine Excel files, and CSVs.
-- Subtotal/"Total"/"Industry"/"Private Total" rows are automatically dropped during cleaning to
-  avoid double-counting against individual insurer rows.
+- Real council files download as `.xls` but are actually **HTML tables** — the parser detects
+  this automatically (no manual conversion needed).
+- The "Detailed New Business Performance" report gives, per insurer: 5 premium categories
+  (Individual Single/Non-Single, Group Single/Non-Single, Group Yearly Renewable) plus a Total
+  row, each with current-month, YTD, same-month-last-year, YTD-last-year, and YTD variation %.
+- The dashboard's core time series uses the **Total** row per insurer per month; the Premium
+  Category Mix tab uses the 5 sub-category rows.
+- Pre-cleaned CSVs (columns: insurer, business_type, premium_current_month, ..., month) are
+  also accepted directly — the year is inferred from the filename (e.g. `nbp_2025_master.csv`
+  → year 2025), since the source month column has no year attached.
+- Demo mode uses a **synthetic dataset** (Total-level only, no category breakdown) for testing
+  the pipeline before real data is available.
 
 **Modeling**
 - Backtesting uses a **rolling-origin, time-ordered split** — never trains on future data.
-- Percentage-based metrics (WAPE, Bias) are used instead of plain MAPE because individual-insurer
-  monthly values can be zero or very small, which makes MAPE unstable.
-- SARIMA and Holt-Winters both assume the recent historical pattern (trend + seasonality)
-  broadly continues; they do not model regulatory changes, new product launches, or macro shocks.
-- With fewer than ~24 months of history, seasonal components are disabled automatically and the
-  models fall back to simpler trend-only estimates — accuracy will be lower until more history
-  is available.
+- With fewer than ~24 months of history, seasonal components are disabled automatically and
+  models fall back to simpler trend-only estimates — accuracy improves as more real months
+  are uploaded.
+- WAPE/Bias are used instead of plain MAPE because individual insurer-month values can be
+  zero or very small, which makes MAPE unstable.
 
 **Forecast use**
 - Forecasts are directional planning inputs, not guarantees — always read alongside the
