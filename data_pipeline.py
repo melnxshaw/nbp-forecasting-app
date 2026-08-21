@@ -1,134 +1,216 @@
 """
-Data ingestion & cleaning pipeline for Life Insurance NBP data.
+Data ingestion & cleaning pipeline for REAL Life Insurance Council NBP data.
 
-Handles THREE input types so real council downloads work without any
-manual conversion:
-  1. Real council files: .xls extension but actually HTML tables
-     (this is what lifeinscouncil.org's "GetData" button produces)
-  2. Genuine Excel files (.xlsx/.xls binary)
-  3. Already-consolidated CSV (e.g. our synthetic master file, or a
-     master file the user maintains themselves)
+The real monthly file (downloaded as .xls, actually HTML) contains a
+"Detailed New Business Performance" table shaped like this, per insurer:
 
-Output: a single tidy long-format DataFrame:
-  Month (YYYY-MM), Insurer, Premium_Rs_Crore, No_of_Policies
+    1   ACKO LIFE INSURANCE COMPANY LIMITED        <- insurer header row (no values)
+        Individual Single Premium        0.00  0.00  0.00  0.00  0.00%   0  0  0  0  0.00%
+        Individual Non Single Premium     0.35  2.73  0.04  0.04  6237%   200 1494 11 13 ...
+        Group Single Premium              ...
+        Group Non Single Premium          ...
+        Group Yearly Renewable Premium    ...
+        Total                             4.36  48.63 4.37  21.72 123.93% 200 1502 12 20 ...
+        (blank separator row)
+    2   ADITYA BIRLA SUN LIFE INSURANCE...
+
+Columns per row (fixed position): Sr.no | Particulars |
+  Premium: For-the-month(curr yr) | Upto-the-month/YTD(curr yr) |
+           For-the-month(prev yr) | Upto-the-month/YTD(prev yr) | YTD Variation %
+  Policies: same 5-column pattern
+
+This gives premium-CATEGORY-level granularity (Individual Single/Non-Single,
+Group Single/Non-Single, Group Yearly Renewable, Total) — richer than a
+simple insurer-total series, and matches the brief's "premium categories"
+requirement directly.
+
+This module also accepts an already-cleaned CSV using simplified column
+names (as produced by manual pre-processing), and a plain aggregated CSV
+(Month, Insurer, Premium_Rs_Crore, No_of_Policies) for backward compatibility
+with demo/synthetic data.
 """
 import io
 import re
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-STANDARD_COLS = ["Month", "Insurer", "Premium_Rs_Crore", "No_of_Policies"]
+# ---------------- Schemas ----------------
 
-# Common column-name variants seen across insurer/regulator reports
-PREMIUM_COL_HINTS = ["premium", "nbp", "new business premium"]
-POLICY_COL_HINTS = ["polic", "no. of lives", "lives", "schemes"]
-INSURER_COL_HINTS = ["insurer", "company", "name of the insurer"]
+ENRICHED_COLS = [
+    "Year", "Month", "MonthName", "Insurer", "BusinessType",
+    "Premium_Current_Month", "Premium_Current_YTD",
+    "Premium_Previous_Month", "Premium_Previous_YTD", "Premium_YTD_Variation_Pct",
+    "Policies_Current_Month", "Policies_Current_YTD",
+    "Policies_Previous_Month", "Policies_Previous_YTD", "Policies_YTD_Variation_Pct",
+]
 
-MONTH_PATTERN = re.compile(r"(20\d{2})[-_]?(0[1-9]|1[0-2])")
+SIMPLE_COLS = ["Month", "Insurer", "Premium_Rs_Crore", "No_of_Policies"]  # legacy/demo format
+
+KNOWN_BUSINESS_TYPES = {
+    "individual single premium", "individual non single premium",
+    "group single premium", "group non single premium",
+    "group yearly renewable premium", "total",
+}
+
+MONTH_NAME_TO_NUM = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june",
+     "july", "august", "september", "october", "november", "december"], start=1)}
+
+TITLE_PATTERN = re.compile(r"Period ended\s+([A-Za-z]+)-(\d{4})", re.I)
+YEAR_IN_FILENAME = re.compile(r"(20\d{2})")
 
 
-def _guess_month_from_filename(filename: str):
-    m = MONTH_PATTERN.search(filename)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    return None
+def _to_float(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).replace("%", "").replace(",", "").strip()
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
 
 
-def _find_col(columns, hints):
-    for c in columns:
-        cl = str(c).lower()
-        for h in hints:
-            if h in cl:
-                return c
-    return None
+def _find_detailed_table(tables):
+    """The detailed per-category table is the largest table with >=10 columns."""
+    candidates = [t for t in tables if t.shape[1] >= 10]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda t: t.shape[0])
 
 
-def _read_any_table(file_bytes: bytes, filename: str) -> list[pd.DataFrame]:
-    """Try HTML first (council files are HTML disguised as .xls), then Excel, then CSV."""
-    tables = []
-    # 1. Try HTML (this is the common case for lifeinscouncil.org exports)
+def parse_detailed_html(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Parses one real council 'Detailed New Business Performance' monthly file."""
     try:
         tables = pd.read_html(io.BytesIO(file_bytes))
-        if tables:
-            return tables
     except Exception:
-        pass
-    # 2. Try genuine Excel
-    try:
-        xls = pd.ExcelFile(io.BytesIO(file_bytes))
-        return [xls.parse(sheet) for sheet in xls.sheet_names]
-    except Exception:
-        pass
-    # 3. Try CSV
-    try:
-        return [pd.read_csv(io.BytesIO(file_bytes))]
-    except Exception:
-        pass
-    return []
+        return pd.DataFrame(columns=ENRICHED_COLS)
+
+    table = _find_detailed_table(tables)
+    if table is None:
+        return pd.DataFrame(columns=ENRICHED_COLS)
+
+    table = table.reset_index(drop=True)
+
+    # find month/year from the title text (usually row 0, may repeat across cols)
+    year, month_num, month_name = None, None, None
+    title_blob = " ".join(str(v) for v in table.head(3).values.flatten())
+    m = TITLE_PATTERN.search(title_blob)
+    if m:
+        month_name = m.group(1).strip().lower()
+        year = int(m.group(2))
+        month_num = MONTH_NAME_TO_NUM.get(month_name)
+    if year is None:
+        yf = YEAR_IN_FILENAME.search(filename)
+        year = int(yf.group(1)) if yf else None
+
+    rows = []
+    current_insurer = None
+    for _, r in table.iterrows():
+        vals = r.tolist()
+        col1 = str(vals[1]).strip() if len(vals) > 1 and pd.notna(vals[1]) else ""
+        rest_na = all(pd.isna(v) for v in vals[2:12]) if len(vals) >= 12 else True
+
+        if col1 == "" and rest_na:
+            continue  # blank separator row
+
+        if col1.lower() not in KNOWN_BUSINESS_TYPES:
+            # this is an insurer header row (or a stray title/label row)
+            if rest_na and col1 and not col1.lower().startswith(("particulars", "s.no", "detailed", "summary")):
+                current_insurer = col1
+            continue
+
+        if current_insurer is None:
+            continue
+
+        rows.append({
+            "Year": year, "Month": f"{year}-{month_num:02d}" if year and month_num else None,
+            "MonthName": month_name.title() if month_name else None,
+            "Insurer": current_insurer,
+            "BusinessType": col1.title() if col1.lower() != "total" else "Total",
+            "Premium_Current_Month": _to_float(vals[2]),
+            "Premium_Current_YTD": _to_float(vals[3]),
+            "Premium_Previous_Month": _to_float(vals[4]),
+            "Premium_Previous_YTD": _to_float(vals[5]),
+            "Premium_YTD_Variation_Pct": _to_float(vals[6]),
+            "Policies_Current_Month": _to_float(vals[7]),
+            "Policies_Current_YTD": _to_float(vals[8]),
+            "Policies_Previous_Month": _to_float(vals[9]),
+            "Policies_Previous_YTD": _to_float(vals[10]),
+            "Policies_YTD_Variation_Pct": _to_float(vals[11]) if len(vals) > 11 else np.nan,
+        })
+
+    return pd.DataFrame(rows, columns=ENRICHED_COLS)
 
 
-def parse_council_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """
-    Parses one monthly council export (HTML-as-.xls, real .xlsx, or .csv)
-    into tidy rows: Month, Insurer, Premium_Rs_Crore, No_of_Policies.
-    Falls back gracefully and returns an empty frame (with a note) if the
-    layout can't be confidently detected, rather than silently guessing wrong.
-    """
-    month_guess = _guess_month_from_filename(filename)
-    tables = _read_any_table(file_bytes, filename)
-
-    best = None
-    for t in tables:
-        if t.shape[0] >= 3 and t.shape[1] >= 2:
-            if best is None or t.shape[0] > best.shape[0]:
-                best = t
-
-    if best is None:
-        return pd.DataFrame(columns=STANDARD_COLS)
-
-    df = best.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    insurer_col = _find_col(df.columns, INSURER_COL_HINTS) or df.columns[0]
-    premium_col = _find_col(df.columns, PREMIUM_COL_HINTS)
-    policy_col = _find_col(df.columns, POLICY_COL_HINTS)
-
-    out = pd.DataFrame()
-    out["Insurer"] = df[insurer_col].astype(str).str.strip()
-    out["Premium_Rs_Crore"] = pd.to_numeric(
-        df[premium_col], errors="coerce") if premium_col else np.nan
-    out["No_of_Policies"] = pd.to_numeric(
-        df[policy_col], errors="coerce") if policy_col else np.nan
-    out["Month"] = month_guess if month_guess else "UNKNOWN"
-
-    # drop subtotal / total / header-junk rows
-    junk_pattern = re.compile(r"total|grand|private|industry|^\s*$|^nan$", re.I)
-    out = out[~out["Insurer"].str.match(junk_pattern, na=False)]
-    out = out.dropna(subset=["Premium_Rs_Crore"], how="all")
-    out = out[out["Insurer"].notna() & (out["Insurer"] != "")]
-
-    return out[STANDARD_COLS].reset_index(drop=True)
+def _map_precleaned_csv(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+    """Maps a manually-precleaned CSV (insurer, business_type, premium_current_month, ...,
+    month [name only, no year]) into the enriched schema, inferring Year from filename."""
+    colmap = {
+        "insurer": "Insurer", "business_type": "BusinessType",
+        "premium_current_month": "Premium_Current_Month", "premium_current_ytd": "Premium_Current_YTD",
+        "premium_previous_month": "Premium_Previous_Month", "premium_previous_ytd": "Premium_Previous_YTD",
+        "premium_ytd_variation": "Premium_YTD_Variation_Pct",
+        "policies_current_month": "Policies_Current_Month", "policies_current_ytd": "Policies_Current_YTD",
+        "policies_previous_month": "Policies_Previous_Month", "policies_previous_ytd": "Policies_Previous_YTD",
+        "policies_ytd_variation": "Policies_YTD_Variation_Pct",
+        "month": "MonthName",
+    }
+    df = df.rename(columns=colmap)
+    yf = YEAR_IN_FILENAME.search(filename)
+    year = int(yf.group(1)) if yf else None
+    df["Year"] = year
+    df["MonthName"] = df["MonthName"].astype(str).str.strip().str.title()
+    df["Month"] = df["MonthName"].map(
+        lambda mn: f"{year}-{MONTH_NAME_TO_NUM.get(mn.lower(), 0):02d}" if year and mn.lower() in MONTH_NAME_TO_NUM else None
+    )
+    df["BusinessType"] = df["BusinessType"].astype(str).str.strip().str.title()
+    df.loc[df["BusinessType"].str.lower() == "total", "BusinessType"] = "Total"
+    for c in ENRICHED_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[ENRICHED_COLS]
 
 
 def consolidate(files: dict) -> pd.DataFrame:
     """
     files: dict of {filename: bytes}
-    Returns one clean consolidated long-format DataFrame across all months.
+    Auto-detects: real council HTML-as-.xls, pre-cleaned simplified CSV,
+    already-enriched CSV, or legacy simple aggregated CSV.
+    Returns one clean consolidated enriched DataFrame across all months.
     """
     frames = []
     for filename, content in files.items():
-        if filename.lower().endswith(".csv"):
+        fl = filename.lower()
+        if fl.endswith(".csv"):
             try:
                 df = pd.read_csv(io.BytesIO(content))
-                if set(STANDARD_COLS).issubset(df.columns):
-                    frames.append(df[STANDARD_COLS])
-                    continue
             except Exception:
-                pass
-        frames.append(parse_council_file(content, filename))
+                continue
+            cols_lower = set(c.lower() for c in df.columns)
+            if set(ENRICHED_COLS).issubset(df.columns):
+                frames.append(df[ENRICHED_COLS])
+            elif {"insurer", "business_type", "premium_current_month", "month"}.issubset(cols_lower):
+                frames.append(_map_precleaned_csv(df, filename))
+            elif set(SIMPLE_COLS).issubset(df.columns):
+                # legacy/demo simple schema -> upgrade to enriched with BusinessType="Total"
+                simple = df[SIMPLE_COLS].copy()
+                simple["BusinessType"] = "Total"
+                simple["Premium_Current_Month"] = simple["Premium_Rs_Crore"]
+                simple["Policies_Current_Month"] = simple["No_of_Policies"]
+                for c in ["Premium_Current_YTD", "Premium_Previous_Month", "Premium_Previous_YTD",
+                          "Premium_YTD_Variation_Pct", "Policies_Current_YTD",
+                          "Policies_Previous_Month", "Policies_Previous_YTD", "Policies_YTD_Variation_Pct"]:
+                    simple[c] = np.nan
+                simple["Year"] = pd.to_datetime(simple["Month"], format="%Y-%m").dt.year
+                simple["MonthName"] = pd.to_datetime(simple["Month"], format="%Y-%m").dt.strftime("%B")
+                frames.append(simple[ENRICHED_COLS])
+            else:
+                continue
+        else:
+            frames.append(parse_detailed_html(content, filename))
 
     if not frames:
-        return pd.DataFrame(columns=STANDARD_COLS)
+        return pd.DataFrame(columns=ENRICHED_COLS)
 
     master = pd.concat(frames, ignore_index=True)
     master = clean_master(master)
@@ -138,23 +220,50 @@ def consolidate(files: dict) -> pd.DataFrame:
 def clean_master(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Insurer"] = (
-        df["Insurer"]
-        .astype(str)
-        .str.strip()
+        df["Insurer"].astype(str).str.strip()
         .str.replace(r"\s+", " ", regex=True)
         .str.replace(r"(?i)^life insurance corporation.*", "LIC", regex=True)
-        .str.replace(r"(?i)\bltd\.?$|\blimited$", "", regex=True)
+        .str.replace(r"(?i)\s*(company)?\s*limited$", "", regex=True)
         .str.strip()
     )
-    df["Premium_Rs_Crore"] = pd.to_numeric(df["Premium_Rs_Crore"], errors="coerce")
-    df["No_of_Policies"] = pd.to_numeric(df["No_of_Policies"], errors="coerce")
-    df = df.dropna(subset=["Month", "Premium_Rs_Crore"])
-    df = df[df["Premium_Rs_Crore"] >= 0]
-    df = df.drop_duplicates(subset=["Month", "Insurer"], keep="last")
-    df = df.sort_values(["Month", "Insurer"]).reset_index(drop=True)
+    num_cols = [c for c in ENRICHED_COLS if c.startswith(("Premium_", "Policies_"))]
+    for c in num_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Month", "Insurer", "BusinessType"])
+    df = df.drop_duplicates(subset=["Month", "Insurer", "BusinessType"], keep="last")
+    df = df.sort_values(["Month", "Insurer", "BusinessType"]).reset_index(drop=True)
     return df
 
 
 def load_master_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
+    if set(SIMPLE_COLS).issubset(df.columns) and not set(ENRICHED_COLS).issubset(df.columns):
+        simple = df[SIMPLE_COLS].copy()
+        simple["BusinessType"] = "Total"
+        simple["Premium_Current_Month"] = simple["Premium_Rs_Crore"]
+        simple["Policies_Current_Month"] = simple["No_of_Policies"]
+        for c in ["Premium_Current_YTD", "Premium_Previous_Month", "Premium_Previous_YTD",
+                  "Premium_YTD_Variation_Pct", "Policies_Current_YTD",
+                  "Policies_Previous_Month", "Policies_Previous_YTD", "Policies_YTD_Variation_Pct"]:
+            simple[c] = np.nan
+        simple["Year"] = pd.to_datetime(simple["Month"], format="%Y-%m").dt.year
+        simple["MonthName"] = pd.to_datetime(simple["Month"], format="%Y-%m").dt.strftime("%B")
+        df = simple[ENRICHED_COLS]
     return clean_master(df)
+
+
+def totals_series(master: pd.DataFrame) -> pd.DataFrame:
+    """Extract insurer-month TOTAL rows -> the simple (Month, Insurer, Premium, Policies)
+    view that feeds EDA/backtesting/forecasting, same as before."""
+    t = master[master["BusinessType"] == "Total"].copy()
+    t = t.rename(columns={
+        "Premium_Current_Month": "Premium_Rs_Crore",
+        "Policies_Current_Month": "No_of_Policies",
+    })
+    return t[["Month", "Insurer", "Premium_Rs_Crore", "No_of_Policies"]].reset_index(drop=True)
+
+
+def category_mix(master: pd.DataFrame) -> pd.DataFrame:
+    """Excludes Total rows -> the 5 premium-category breakdown for mix analysis."""
+    c = master[master["BusinessType"] != "Total"].copy()
+    return c
